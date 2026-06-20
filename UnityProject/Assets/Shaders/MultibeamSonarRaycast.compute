@@ -1,13 +1,21 @@
 #pragma kernel CSMain
 
 // ============================================================================
-//  Multibeam Sonar Raycasting Compute Shader
-//  Uses analytic DDA traversal of Heightmap to avoid per-pixel texture lookups
-//  for thousands of concurrent sonar beams.
+//  Multibeam Sonar Raycasting Compute Shader (HARDENED VERSION)
+//
+//  Stability fixes against TDR:
+//   [1] All loops carry compile-time-constant upper bounds + [unroll]/[loop]
+//   [2] Grazing-angle (|rd.y| small) fast-path with coarse fixed-step march
+//   [3] DDA step budget reduced to 192; early termination on cell stagnation
+//   [4] Bisection refinement with explicit residual check (|tA-tB|<eps)
+//   [5] Uniform warp-lane exit: every thread returns within bounded cycles
 // ============================================================================
 
-#define MAX_STEPS 512
-#define EPS       1e-5
+#define DDA_MAX_STEPS      192     // hard upper bound (TDR-safe)
+#define GRAZING_MAX_STEPS  96
+#define BISECTION_STEPS    8       // reduced from 10; residual < cellSize/256 at step 8
+#define EPS_GLOBAL         1e-5f
+#define GRAZING_TAN_THRESH 0.04f   // |rd.y| / |rd_xz| < tan(2.3°) → grazing
 
 struct Result
 {
@@ -29,25 +37,28 @@ uniform int   _Resolution;
 uniform float _SizeX;
 uniform float _SizeZ;
 uniform float _BaseDepth;
-uniform float4 _Origin;      // xz = world origin (top-left corner), y=0, w=unused
+uniform float4 _Origin;      // xz = world origin (top-left corner)
 uniform float _MaxRange;
 uniform float _MinRange;
 
 float3 worldToUVW(float3 p)
 {
-    float u = (p.x - _Origin.x) / _SizeX;
-    float w = (p.z - _Origin.z) / _SizeZ;
-    return float3(u, p.y, w);
+    return float3(
+        (p.x - _Origin.x) / _SizeX,
+        p.y,
+        (p.z - _Origin.z) / _SizeZ
+    );
 }
 
 float sampleHeightBilinear(float u, float v)
 {
-    u = clamp(u, 0.0, 0.99999);
-    v = clamp(v, 0.0, 0.99999);
-    float fx = u * float(_Resolution - 1);
-    float fz = v * float(_Resolution - 1);
-    int   x0 = int(floor(fx));
-    int   z0 = int(floor(fz));
+    u = clamp(u, 0.0f, 0.99999f);
+    v = clamp(v, 0.0f, 0.99999f);
+    float Rm1 = float(_Resolution - 1);
+    float fx = u * Rm1;
+    float fz = v * Rm1;
+    int   x0 = (int)floor(fx);
+    int   z0 = (int)floor(fz);
     int   x1 = min(x0 + 1, _Resolution - 1);
     int   z1 = min(z0 + 1, _Resolution - 1);
     float sx = fx - float(x0);
@@ -59,36 +70,96 @@ float sampleHeightBilinear(float u, float v)
     float h01 = _Heightmap[z1 * R + x0];
     float h11 = _Heightmap[z1 * R + x1];
 
-    float hx0 = lerp(h00, h10, sx);
-    float hx1 = lerp(h01, h11, sx);
-    float hy  = lerp(hx0, hx1, sz);
-
+    float hy = lerp(lerp(h00, h10, sx), lerp(h01, h11, sx), sz);
     return -_BaseDepth + hy;
 }
 
-// DDA traversal over 2D grid in (xz plane), sampling height at each step.
-// Returns range along ray where seafloor is penetrated; -1 if no hit.
+// -----------------------------------------------------------
+// Ray-segment vs heightmap overlap test (fast grazing march)
+// -----------------------------------------------------------
+float marchGrazing(float3 ro, float3 rd, out float3 hitPos, out float3 hitNormal)
+{
+    float invRdxz = rsqrt(max(1e-8f, rd.x*rd.x + rd.z*rd.z));
+    float stepLen = (max(_SizeX, _SizeZ) / float(_Resolution)) * 1.415f; // diagonal of cell
+    int   N = min(GRAZING_MAX_STEPS, (int)ceil(_MaxRange / stepLen));
+
+    float prevT = 0.0f;
+    float prevH = sampleHeightBilinear(
+        clamp(worldToUVW(ro).x, 0.0f, 1.0f),
+        clamp(worldToUVW(ro).z, 0.0f, 1.0f));
+    float prevY = ro.y;
+
+    [loop]
+    for (int s = 1; s <= N; s++)
+    {
+        float  t = min(_MaxRange, float(s) * stepLen);
+        float3 p = ro + rd * t;
+        float3 uvw = worldToUVW(p);
+        if (uvw.x < 0.0f || uvw.x > 1.0f || uvw.z < 0.0f || uvw.z > 1.0f) break;
+        float h = sampleHeightBilinear(uvw.x, uvw.z);
+        float y = p.y;
+
+        // bracketing?
+        if ((prevY - prevH) * (y - h) <= 0.0f && t >= _MinRange)
+        {
+            // local bisection in [prevT, t]
+            float tA = prevT, tB = t;
+            float yA = prevY, hA = prevH;
+            [unroll]
+            for (int b = 0; b < BISECTION_STEPS; b++)
+            {
+                float tM = 0.5f * (tA + tB);
+                if (tB - tA < 1e-4f * stepLen) break; // residual convergence
+                float3 pM = ro + rd * tM;
+                float3 uM = worldToUVW(pM);
+                float hM = sampleHeightBilinear(uM.x, uM.z);
+                float yM = pM.y;
+                if ((yA - hA) * (yM - hM) > 0.0f) { tA = tM; yA = yM; hA = hM; }
+                else                                { tB = tM; }
+            }
+            float tHit = 0.5f * (tA + tB);
+            float3 pHit = ro + rd * tHit;
+            float3 uvHit = worldToUVW(pHit);
+            float cu = 1.0f / float(_Resolution - 1);
+            float hL = sampleHeightBilinear(uvHit.x - cu, uvHit.z);
+            float hR = sampleHeightBilinear(uvHit.x + cu, uvHit.z);
+            float hD = sampleHeightBilinear(uvHit.x, uvHit.z - cu);
+            float hU = sampleHeightBilinear(uvHit.x, uvHit.z + cu);
+            float3 n = normalize(float3(hL - hR, 2.0f * cu * max(_SizeX, _SizeZ), hD - hU));
+            hitPos = pHit;
+            hitNormal = n;
+            return tHit;
+        }
+        prevT = t; prevH = h; prevY = y;
+    }
+    return -1.0f;
+}
+
+// -----------------------------------------------------------
+// DDA traversal (used for steeper rays)
+// -----------------------------------------------------------
 float raycastHeightmap(float3 ro, float3 rd, out float3 hitPos, out float3 hitNormal)
 {
     hitPos = ro + rd * _MaxRange;
-    hitNormal = float3(0, 1, 0);
+    hitNormal = float3(0.0f, 1.0f, 0.0f);
 
-    if (abs(rd.y) < 1e-4 && ro.y > sampleHeightBilinear(0.5, 0.5))
+    // Fast-path grazing detection
+    float rdxzLen = sqrt(max(1e-10f, rd.x*rd.x + rd.z*rd.z));
+    if (abs(rd.y) < GRAZING_TAN_THRESH * rdxzLen)
     {
-        // if ray is nearly horizontal and we're above seafloor, we might still miss
+        return marchGrazing(ro, rd, hitPos, hitNormal);
     }
 
     float3 uvw0 = worldToUVW(ro);
     float3 uvw1 = worldToUVW(ro + rd * _MaxRange);
-
     float du = uvw1.x - uvw0.x;
     float dw = uvw1.z - uvw0.z;
 
-    if (abs(du) < EPS && abs(dw) < EPS)
+    // Degenerate near-vertical
+    if (abs(du) < EPS_GLOBAL && abs(dw) < EPS_GLOBAL)
     {
-        // degenerate case: straight vertical along y
-        float terrainY = sampleHeightBilinear(clamp(uvw0.x, 0.0, 1.0), clamp(uvw0.z, 0.0, 1.0));
-        if (rd.y < 0.0 && ro.y > terrainY)
+        float terrainY = sampleHeightBilinear(clamp(uvw0.x, 0.0f, 1.0f), clamp(uvw0.z, 0.0f, 1.0f));
+        if (rd.y < 0.0f && ro.y > terrainY)
         {
             float t = (terrainY - ro.y) / rd.y;
             if (t > _MinRange && t < _MaxRange)
@@ -97,83 +168,99 @@ float raycastHeightmap(float3 ro, float3 rd, out float3 hitPos, out float3 hitNo
                 return t;
             }
         }
-        return -1.0;
+        return -1.0f;
     }
 
-    int   stepX = du >= 0.0 ? 1 : -1;
-    int   stepZ = dw >= 0.0 ? 1 : -1;
+    int   stepX = (du >= 0.0f) ? 1 : -1;
+    int   stepZ = (dw >= 0.0f) ? 1 : -1;
+    bool  duTiny = (abs(du) < 1e-9f);
+    bool  dwTiny = (abs(dw) < 1e-9f);
+    float invDu = duTiny ? 1e10f : 1.0f / du;
+    float invDw = dwTiny ? 1e10f : 1.0f / dw;
+    // Safety: ensure sign(step) matches sign(inv) when not tiny
+    if (!duTiny && ((stepX > 0) != (invDu > 0.0f))) invDu = -invDu;
+    if (!dwTiny && ((stepZ > 0) != (invDw > 0.0f))) invDw = -invDw;
 
-    float invDu = abs(du) > 1e-10 ? 1.0 / du : 1e10;
-    float invDw = abs(dw) > 1e-10 ? 1.0 / dw : 1e10;
+    float cellU = 1.0f / float(_Resolution - 1);
+    float cellW = 1.0f / float(_Resolution - 1);
+    float startU = clamp(uvw0.x, 0.0f, 1.0f - 1e-6f);
+    float startW = clamp(uvw0.z, 0.0f, 1.0f - 1e-6f);
+    int   cellX = (int)floor(startU * float(_Resolution - 1));
+    int   cellZ = (int)floor(startW * float(_Resolution - 1));
+    cellX = clamp(cellX, 0, _Resolution - 2);
+    cellZ = clamp(cellZ, 0, _Resolution - 2);
 
-    float cellU = 1.0 / float(_Resolution - 1);
-    float cellW = 1.0 / float(_Resolution - 1);
-
-    float startU = clamp(uvw0.x, 0.0, 1.0 - 1e-6);
-    float startW = clamp(uvw0.z, 0.0, 1.0 - 1e-6);
-
-    int   cellX = int(floor(startU * float(_Resolution - 1)));
-    int   cellZ = int(floor(startW * float(_Resolution - 1)));
-
-    float nextU = (float(cellX + (stepX > 0 ? 1 : 0)) + 0.0) / float(_Resolution - 1);
-    float nextW = (float(cellZ + (stepZ > 0 ? 1 : 0)) + 0.0) / float(_Resolution - 1);
-
+    float nextU = float(cellX + ((stepX > 0) ? 1 : 0)) / float(_Resolution - 1);
+    float nextW = float(cellZ + ((stepZ > 0) ? 1 : 0)) / float(_Resolution - 1);
     float tMaxU = (nextU - uvw0.x) * invDu;
     float tMaxW = (nextW - uvw0.z) * invDw;
-    if (du >= 0) tMaxU = max(0.0, tMaxU); else tMaxU = max(0.0, tMaxU);
-    if (dw >= 0) tMaxW = max(0.0, tMaxW); else tMaxW = max(0.0, tMaxW);
-
+    // Sign-corrected non-negative initial values
+    tMaxU = duTiny ? 1e20f : max(0.0f, tMaxU);
+    tMaxW = dwTiny ? 1e20f : max(0.0f, tMaxW);
     float tDeltaU = abs(cellU * invDu);
     float tDeltaW = abs(cellW * invDw);
+    // Prevent infinite tDelta on degenerate axes
+    if (duTiny) tDeltaU = 1e20f;
+    if (dwTiny) tDeltaW = 1e20f;
 
-    float prevT = 0.0;
-    float curT  = 0.0;
+    float prevT = 0.0f;
+    int   stagnationGuard = 0;
+    float lastNextT = -1.0f;
 
     [loop]
-    for (int i = 0; i < MAX_STEPS; i++)
+    for (int i = 0; i < DDA_MAX_STEPS; i++)
     {
         if (cellX < 0 || cellX >= _Resolution - 1 || cellZ < 0 || cellZ >= _Resolution - 1) break;
 
-        float u = (float(cellX) + 0.5) / float(_Resolution - 1);
-        float v = (float(cellZ) + 0.5) / float(_Resolution - 1);
+        float u = (float(cellX) + 0.5f) * cellU;
+        float v = (float(cellZ) + 0.5f) * cellW;
         float hy = sampleHeightBilinear(u, v);
-
         float prevY = ro.y + rd.y * prevT;
-        float nextT;
 
+        float nextT;
         if (tMaxU < tMaxW) { nextT = tMaxU; tMaxU += tDeltaU; cellX += stepX; }
         else               { nextT = tMaxW; tMaxW += tDeltaW; cellZ += stepZ; }
 
+        // Stagnation guard: if t doesn't advance by >eps for 3 consecutive steps → bail
+        if (nextT - lastNextT < 1e-7f) { if (++stagnationGuard >= 3) break; }
+        else stagnationGuard = 0;
+        lastNextT = nextT;
+
         if (nextT > _MaxRange) nextT = _MaxRange;
-        curT = nextT;
+        float curT = nextT;
         float curY = ro.y + rd.y * curT;
 
         float minY = min(prevY, curY);
         float maxY = max(prevY, curY);
-        if (hy >= minY && hy <= maxY)
+        if (hy >= minY - 1e-4f && hy <= maxY + 1e-4f)
         {
-            // linear search within cell for more precision
             float tA = prevT, tB = curT;
+            float yA = prevY, hRefA = hy;
             [unroll]
-            for (int s = 0; s < 10; s++)
+            for (int s = 0; s < BISECTION_STEPS; s++)
             {
-                float tM = 0.5 * (tA + tB);
+                float resT = tB - tA;
+                if (resT < 1e-5f) break; // residual convergence
+                float tM = 0.5f * (tA + tB);
                 float3 pM = ro + rd * tM;
                 float3 uvwM = worldToUVW(pM);
                 float hM = sampleHeightBilinear(uvwM.x, uvwM.z);
                 float yM = pM.y;
-                if (yM > hM) tA = tM; else tB = tM;
+                // same-side test
+                if ((yA - hRefA) * (yM - hM) > 0.0f) { tA = tM; yA = yM; hRefA = hM; }
+                else                                  { tB = tM; }
             }
-            float tHit = 0.5 * (tA + tB);
+            float tHit = 0.5f * (tA + tB);
             if (tHit >= _MinRange && tHit <= _MaxRange)
             {
                 float3 pHit = ro + rd * tHit;
                 float3 uvwHit = worldToUVW(pHit);
-                float hL = sampleHeightBilinear(uvwHit.x - cellU, uvwHit.z);
-                float hR = sampleHeightBilinear(uvwHit.x + cellU, uvwHit.z);
-                float hD = sampleHeightBilinear(uvwHit.x, uvwHit.z - cellW);
-                float hU = sampleHeightBilinear(uvwHit.x, uvwHit.z + cellW);
-                float3 n = normalize(float3(hL - hR, 2.0 * cellU * max(_SizeX, _SizeZ) / float(_Resolution), hD - hU));
+                float hL = sampleHeightBilinear(clamp(uvwHit.x - cellU, 0.0f, 1.0f), uvwHit.z);
+                float hR = sampleHeightBilinear(clamp(uvwHit.x + cellU, 0.0f, 1.0f), uvwHit.z);
+                float hD = sampleHeightBilinear(uvwHit.x, clamp(uvwHit.z - cellW, 0.0f, 1.0f));
+                float hU = sampleHeightBilinear(uvwHit.x, clamp(uvwHit.z + cellW, 0.0f, 1.0f));
+                float ny = 2.0f * cellU * max(_SizeX, _SizeZ);
+                float3 n = normalize(float3(hL - hR, ny, hD - hU));
                 hitPos = pHit;
                 hitNormal = n;
                 return tHit;
@@ -182,47 +269,44 @@ float raycastHeightmap(float3 ro, float3 rd, out float3 hitPos, out float3 hitNo
         prevT = curT;
         if (curT >= _MaxRange) break;
     }
-    return -1.0;
+    return -1.0f;
 }
 
 [numthreads(64, 1, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
     uint beamId = id.x;
+
     Result r;
-    r.pos = 0.0;
-    r.depth = 0.0;
-    r.intensity = 0.0;
-    r.range = _MaxRange;
-    r.beamId = beamId;
-    r.hit = 0;
-    r.pad = 0.0;
+    r.pos = 0.0f; r.depth = 0.0f; r.intensity = -120.0f;
+    r.range = _MaxRange; r.beamId = beamId; r.hit = 0; r.pad = 0.0f;
 
     float3 ro = _Origins[beamId];
-    float3 rd = normalize(_Directions[beamId] + float3(1e-7, 0.0, 0.0));
+    float3 rawDir = _Directions[beamId];
+    // Safe normalize (guard against zero-length input)
+    float len = length(rawDir) + 1e-9f;
+    float3 rd = rawDir / len;
+
+    // Quick early-out: direction points strongly upward → never hits seafloor
+    if (rd.y > 0.3f) { _Results[beamId] = r; return; }
 
     float3 normal;
     float3 hitPos;
     float t = raycastHeightmap(ro, rd, hitPos, normal);
 
-    if (t > 0.0)
+    if (t > 0.0f)
     {
         r.hit = 1;
         r.range = t;
         r.pos = hitPos;
-        r.depth = ro.y - hitPos.y;
-        float cosIncident = max(0.01, dot(-rd, normal));
-        float spreading = 20.0 * log10(max(0.01, t)) * 0.05;
-        r.intensity = -spreading - t * 0.02 + cosIncident * 20.0;
+        r.depth = max(0.0f, ro.y - hitPos.y);
+        float cosIncident = max(0.01f, dot(-rd, normal));
+        float spreading = 20.0f * log10(max(0.01f, t)) * 0.05f;
+        r.intensity = -spreading - t * 0.02f + cosIncident * 20.0f;
     }
     else
     {
         r.pos = ro + rd * _MaxRange;
-        r.range = _MaxRange;
-        r.depth = 0.0;
-        r.hit = 0;
-        r.intensity = -120.0;
     }
-
     _Results[beamId] = r;
 }

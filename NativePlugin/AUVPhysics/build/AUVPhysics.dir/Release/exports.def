@@ -1,10 +1,14 @@
 EXPORTS 
 	_Avx2WmemEnabledWeakValue 	 DATA
+	??$isinf@M@@YA_NM@Z
+	??$isnan@M@@YA_NM@Z
 	??$max@M@std@@YAAEBMAEBM0@Z
+	??$min@M@std@@YAAEBMAEBM0@Z
 	??$move@AEAM@std@@YA$$QEAMAEAM@Z
 	??$swap@M$0A@@std@@YAXAEAM0@Z
 	?cos@@YAMM@Z
 	?fabs@@YAMM@Z
+	?fpclassify@@YAHM@Z
 	?log10@@YAMM@Z
 	?sin@@YAMM@Z
 	?sqrt@@YAMM@Z
