@@ -45,6 +45,7 @@ namespace DeepseaAUV
             BuildTerrain();
             BuildAUV();
             BuildSonar();
+            BuildAI();
             BuildPointCloud();
             BuildCameraAndLights();
             BuildCanvasUI();
@@ -114,6 +115,40 @@ namespace DeepseaAUV
 
             AUV = auvGO.AddComponent<AUVController>();
             auvGO.AddComponent<AUVKeyboardInput>();
+        }
+
+        private AI.AUVAutopilot    Autopilot       { get; set; }
+        private AI.ObstacleMapper  ObstacleMapper  { get; set; }
+
+        private void BuildAI()
+        {
+            // ObstacleMapper (child of AUV)
+            var mapperGO = new GameObject("ObstacleMapper");
+            mapperGO.transform.SetParent(AUV.transform, false);
+            mapperGO.transform.localPosition = Vector3.zero;
+            var mapper = mapperGO.AddComponent<AI.ObstacleMapper>();
+            SetPrivate(mapper, "_gridSize", 96);
+            SetPrivate(mapper, "_cellSize", 1.6f);
+            SetPrivate(mapper, "_dangerThreshold", 2.8f);
+            SetPrivate(mapper, "_sonar", Sonar);
+            SetPrivate(mapper, "_auv", AUV.transform);
+            ObstacleMapper = mapper;
+
+            // Autopilot (on AUV root)
+            var autopilot = AUV.gameObject.AddComponent<AI.AUVAutopilot>();
+            SetPrivate(autopilot, "_mapper", mapper);
+            SetPrivate(autopilot, "_mode", AI.AUVMode.AutoCruise);
+            SetPrivate(autopilot, "_cruiseSpeed", 2.2f);
+            SetPrivate(autopilot, "_lookahead", 9f);
+            SetPrivate(autopilot, "_maxRRTIterations", 1200);
+            SetPrivate(autopilot, "_rrtTimeBudgetMs", 350f);
+            SetPrivate(autopilot, "_safetyMargin", 3.5f);
+            SetPrivate(autopilot, "_replanInterval", 1.5f);
+            SetPrivate(autopilot, "_drawDebug", true);
+            Autopilot = autopilot;
+
+            // Path visualizer
+            AUV.gameObject.AddComponent<PathVisualizer>();
         }
 
         private static void BuildAUVVisual(Transform parent)
@@ -351,6 +386,48 @@ namespace DeepseaAUV
             SetPrivate(panel, "_posLabel", labels[2]);
             SetPrivate(panel, "_pressureLabel", labels[3]);
             SetPrivate(panel, "_statusLabel", labels[4]);
+
+            // ---- AI Status Panel ----
+            var aiGO = new GameObject("AIStatusPanel");
+            aiGO.transform.SetParent(canvasGO.transform, false);
+            var aiPanel = aiGO.AddComponent<UI.AIStatusPanel>();
+
+            // AI labels (below the main info labels)
+            string[] aiNames = { "AIModeLabel", "AIPlanLabel", "AIClusterLabel", "AISpeedLabel", "AIHintLabel" };
+            Vector2[] aiPositions = {
+                new Vector2(16, -180), new Vector2(16, -204), new Vector2(16, -228),
+                new Vector2(16, -252), new Vector2(16, -280)
+            };
+            Text[] aiLabels = new Text[aiNames.Length];
+            for (int i = 0; i < aiNames.Length; i++)
+            {
+                var go = new GameObject(aiNames[i]);
+                go.transform.SetParent(aiGO.transform, false);
+                var t = go.AddComponent<Text>();
+                t.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+                t.fontSize = i == 4 ? 11 : 13;
+                t.alignment = TextAnchor.MiddleLeft;
+                t.color = i == 0 ? new Color(0.3f, 1f, 0.6f, 1f) : new Color(0.55f, 0.85f, 1f, 1f);
+                if (i == 4) t.color = new Color(0.6f, 0.75f, 0.9f, 0.8f);
+                t.text = "AI: ---";
+                var r = t.GetComponent<RectTransform>();
+                r.anchorMin = new Vector2(0, 1);
+                r.anchorMax = new Vector2(0, 1);
+                r.pivot = new Vector2(0, 1);
+                r.anchoredPosition = aiPositions[i];
+                r.sizeDelta = new Vector2(520, 22);
+                aiLabels[i] = t;
+            }
+            SetPrivate(aiPanel, "_modeLabel",    aiLabels[0]);
+            SetPrivate(aiPanel, "_planLabel",    aiLabels[1]);
+            SetPrivate(aiPanel, "_clusterLabel", aiLabels[2]);
+            SetPrivate(aiPanel, "_speedLabel",   aiLabels[3]);
+            SetPrivate(aiPanel, "_hintLabel",    aiLabels[4]);
+
+            if (Autopilot != null && ObstacleMapper != null)
+            {
+                aiPanel.Setup(Autopilot, ObstacleMapper);
+            }
         }
 
         private static void SetPrivate<T>(object target, string fieldName, T value)

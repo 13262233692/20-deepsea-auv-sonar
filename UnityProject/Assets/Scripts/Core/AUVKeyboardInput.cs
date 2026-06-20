@@ -1,4 +1,5 @@
 using UnityEngine;
+using DeepseaAUV.AI;
 
 namespace DeepseaAUV
 {
@@ -20,15 +21,28 @@ namespace DeepseaAUV
         [SerializeField] private KeyCode _boostKey = KeyCode.LeftShift;
         [SerializeField] private float   _boostMul = 2.5f;
 
+        [Header("Mode Toggle")]
+        [SerializeField] private KeyCode _toggleAutoKey = KeyCode.Tab;
+
         private AUVController _auv;
+        private AUVAutopilot  _autopilot;
 
         private void Awake()
         {
             _auv = GetComponent<AUVController>();
+            _autopilot = GetComponent<AUVAutopilot>();
         }
 
         private void Update()
         {
+            if (Input.GetKeyDown(_toggleAutoKey) && _autopilot != null)
+            {
+                _autopilot.Mode = (_autopilot.Mode == AUVMode.Manual) ? AUVMode.AutoCruise : AUVMode.Manual;
+            }
+
+            if (_autopilot != null && _autopilot.Mode != AUVMode.Manual)
+                return; // let autopilot handle control
+
             Vector3 F = Vector3.zero;
             Vector3 T = Vector3.zero;
             float boost = Input.GetKey(_boostKey) ? _boostMul : 1f;
