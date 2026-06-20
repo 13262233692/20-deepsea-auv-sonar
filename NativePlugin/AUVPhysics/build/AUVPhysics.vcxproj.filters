@@ -1,0 +1,22 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="D:\SOLO-0619-3\20-deepsea-auv-sonar\NativePlugin\AUVPhysics\src\HydrodynamicsSolver.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\SOLO-0619-3\20-deepsea-auv-sonar\NativePlugin\AUVPhysics\src\AUVState.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\SOLO-0619-3\20-deepsea-auv-sonar\NativePlugin\AUVPhysics\src\SonarSimulator.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\SOLO-0619-3\20-deepsea-auv-sonar\NativePlugin\AUVPhysics\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{1B9DD1DE-BE97-33F8-85F6-D1741D1212DE}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

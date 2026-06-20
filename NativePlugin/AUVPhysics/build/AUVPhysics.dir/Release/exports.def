@@ -1,0 +1,26 @@
+EXPORTS 
+	_Avx2WmemEnabledWeakValue 	 DATA
+	??$max@M@std@@YAAEBMAEBM0@Z
+	??$move@AEAM@std@@YA$$QEAMAEAM@Z
+	??$swap@M$0A@@std@@YAXAEAM0@Z
+	?cos@@YAMM@Z
+	?fabs@@YAMM@Z
+	?log10@@YAMM@Z
+	?sin@@YAMM@Z
+	?sqrt@@YAMM@Z
+	AUV_ApplyControlForce
+	AUV_ComputeHydrodynamics
+	AUV_ComputeHydrostaticPressure
+	AUV_GetState
+	AUV_Init
+	AUV_SetState
+	AUV_Update
+	Sonar_ComputeIntensity
+	Sonar_GeneratePingDirections
+	Sonar_GetBeamCount
+	Sonar_Init
+	Sonar_SetPose
+	State_IntegrateAngular
+	State_IntegrateLinear
+	State_Reset
+	fabsf

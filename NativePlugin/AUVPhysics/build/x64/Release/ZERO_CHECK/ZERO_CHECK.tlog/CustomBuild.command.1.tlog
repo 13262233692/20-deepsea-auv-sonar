@@ -1,0 +1,10 @@
+^D:\SOLO-0619-3\20-DEEPSEA-AUV-SONAR\NATIVEPLUGIN\AUVPHYSICS\BUILD\CMAKEFILES\76455AFE9EF1466D6642F6AB63A2511D\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/SOLO-0619-3/20-deepsea-auv-sonar/NativePlugin/AUVPhysics -BD:/SOLO-0619-3/20-deepsea-auv-sonar/NativePlugin/AUVPhysics/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/SOLO-0619-3/20-deepsea-auv-sonar/NativePlugin/AUVPhysics/build/AUVPhysics.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
